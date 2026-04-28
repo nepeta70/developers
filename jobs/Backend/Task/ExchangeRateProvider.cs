@@ -1,17 +1,22 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Linq;
-using System.Net.Http;
 
 namespace ExchangeRateUpdater
 {
     public class ExchangeRateProvider
     {
-        private const string SourceUrl = "https://www.cnb.cz/en/financial-markets/foreign-exchange-market/central-bank-exchange-rate-fixing/central-bank-exchange-rate-fixing/daily.txt";
-        private readonly Currency _targetCurrency = new("CZK");
-        private readonly HttpClient _client = new();
+        private readonly CnbSettings _settings;
+        private readonly Currency _targetCurrency;
+        private readonly ICnbClient _cnbClient;
+
+        public ExchangeRateProvider(CnbSettings settings, ICnbClient cnbClient)
+        {
+            _settings = settings;
+            _targetCurrency = new Currency(_settings.TargetCurrencyCode);
+            _cnbClient = cnbClient;
+        }
 
         /// <summary>
         /// Should return exchange rates among the specified currencies that are defined by the source. But only those defined
@@ -27,69 +32,40 @@ namespace ExchangeRateUpdater
             if (requestedCurrencies.Count == 0)
             {
                 return [];
+
             }
 
-            string rawData;
-
-            try
-            {
-                rawData = ReadRawData();
-            }
-            catch (HttpRequestException)
-            {
-                return [];
-            }
-            catch (IOException)
+            var (success, rawData) = _cnbClient.GetRawDailyExchanges();
+            if (!success)
             {
                 return [];
             }
 
-            var lines = rawData.Split(["\n", "\r\n"], StringSplitOptions.RemoveEmptyEntries);
-
-            var rates = new List<ExchangeRate>();
-
-            // Skip header rows 0 and 1
-            foreach (var line in lines.Skip(2))
-            {
-                try
-                {
-                    var cols = line.Split('|');
-                    if (cols.Length < 5) continue;
-
-                    var code = cols[3];
-                    if (requestedCurrencies.ContainsKey(code))
-                    {
-                        if (int.TryParse(cols[2], out int amount) && amount > 0 &&
-                            decimal.TryParse(cols[4], CultureInfo.InvariantCulture, out decimal rateValue))
-                        {
-                            decimal unitValue = rateValue / amount;
-
-                            rates.Add(new ExchangeRate(
-                                requestedCurrencies[code],
-                                _targetCurrency,
-                                unitValue
-                            ));
-                        }
-                    }
-                }
-                catch (Exception) // Catch any parsing exceptions and skip the line
-                {
-                    continue;
-                }
-            }
-
+            var rates = ParseData(rawData, requestedCurrencies);
             return rates;
         }
 
-        private string ReadRawData()
+        private IEnumerable<ExchangeRate> ParseData(string rawData, Dictionary<string, Currency> requestedCurrencies)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, SourceUrl);
-            using var response = _client.Send(request);
+            var rates = new List<ExchangeRate>();
+            var lines = rawData.Split(["\n", "\r\n"], StringSplitOptions.RemoveEmptyEntries);
 
-            response.EnsureSuccessStatusCode();
+            foreach (var line in lines.Skip(2))
+            {
+                var cols = line.Split('|');
+                if (cols.Length < 5) continue;
 
-            using var reader = new StreamReader(response.Content.ReadAsStream());
-            return reader.ReadToEnd();
+                var code = cols[3].Trim();
+                if (requestedCurrencies.TryGetValue(code, out var sourceCurrency))
+                {
+                    if (int.TryParse(cols[2].Trim(), out int amount) && amount > 0 &&
+                        decimal.TryParse(cols[4].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out decimal rateValue))
+                    {
+                        rates.Add(new ExchangeRate(sourceCurrency, _targetCurrency, rateValue / amount));
+                    }
+                }
+            }
+            return rates;
         }
     }
 }
